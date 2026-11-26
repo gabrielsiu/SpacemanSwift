@@ -2,12 +2,15 @@
 //  ZoomableView.swift
 //  SpacemanSwift
 //
-//  Pinch-to-zoom, drag-to-pan and double-tap-to-zoom container.
+//  Pinch-to-zoom, pan and double-tap-to-zoom container built on UIScrollView,
+//  so zoom tracks the pinch centroid, the same two fingers can pan mid-pinch,
+//  and the limits rubber-band — like Photos / Apollo.
 //  When not zoomed, a horizontal swipe drags the strip with the finger and
 //  calls `onSwipe` once it commits.
 //
 
 import SwiftUI
+import UIKit
 
 enum SwipeDirection { case left, right }
 
@@ -22,104 +25,194 @@ struct ZoomableView<Content: View>: View {
     var onSwipe: ((SwipeDirection) -> Void)?
     @ViewBuilder var content: Content
 
-    private let maxScale: CGFloat = 5
-
-    @State private var baseScale: CGFloat = 1
-    @State private var offset: CGSize = .zero
-    @State private var baseOffset: CGSize = .zero
-
     var body: some View {
-        GeometryReader { proxy in
-            ZStack {
-                // Darkens as the user zooms, to emphasize the strip.
-                Color.black
-                    .opacity(min((scale - 1) / 0.5, 1) * 0.9)
-                content
-                    .frame(width: proxy.size.width, height: proxy.size.height)
-                    .scaleEffect(scale)
-                    .offset(offset)
-                    .offset(x: swipeOffset)
-            }
-            .frame(width: proxy.size.width, height: proxy.size.height)
-            // Make the whole area (not just the strip) respond to gestures.
-            .contentShape(Rectangle())
-            .gesture(dragGesture(in: proxy.size))
-            .simultaneousGesture(magnifyGesture(in: proxy.size))
-            .onTapGesture(count: 2) { toggleZoom() }
+        ZStack {
+            // Darkens as the user zooms, to emphasize the strip.
+            Color.black
+                .opacity(min((scale - 1) / 0.5, 1) * 0.9)
+            ZoomScrollView(scale: $scale, swipeOffset: $swipeOffset,
+                           canSwipe: canSwipe, onSwipe: onSwipe, content: content)
+                .offset(x: swipeOffset)
         }
         .clipped()
         .ignoresSafeArea()
-        .onChange(of: scale) { _, newScale in
-            if newScale <= 1 {
-                baseScale = 1
-                offset = .zero
-                baseOffset = .zero
-            } else {
-                baseScale = newScale
-            }
+    }
+}
+
+private struct ZoomScrollView<Content: View>: UIViewRepresentable {
+    @Binding var scale: CGFloat
+    @Binding var swipeOffset: CGFloat
+    var canSwipe: (SwipeDirection) -> Bool
+    var onSwipe: ((SwipeDirection) -> Void)?
+    var content: Content
+
+    func makeCoordinator() -> Coordinator { Coordinator(self) }
+
+    func makeUIView(context: Context) -> FittingScrollView {
+        let coordinator = context.coordinator
+        let scrollView = FittingScrollView()
+        scrollView.delegate = coordinator
+        scrollView.minimumZoomScale = 1
+        scrollView.maximumZoomScale = 5
+        scrollView.bouncesZoom = true
+        scrollView.showsHorizontalScrollIndicator = false
+        scrollView.showsVerticalScrollIndicator = false
+        scrollView.contentInsetAdjustmentBehavior = .never
+        scrollView.backgroundColor = .clear
+        // At 1x the content exactly fits, so the scroll view must not bounce
+        // on its own; the page swipe below handles horizontal drags instead.
+        scrollView.alwaysBounceHorizontal = false
+        scrollView.alwaysBounceVertical = false
+        scrollView.decelerationRate = .fast
+
+        let host = UIHostingController(rootView: content)
+        host.view.backgroundColor = .clear
+        host.safeAreaRegions = []
+        scrollView.addSubview(host.view)
+        scrollView.hostView = host.view
+        coordinator.host = host
+        coordinator.scrollView = scrollView
+
+        let doubleTap = UITapGestureRecognizer(target: coordinator, action: #selector(Coordinator.doubleTapped(_:)))
+        doubleTap.numberOfTapsRequired = 2
+        scrollView.addGestureRecognizer(doubleTap)
+
+        let pageSwipe = UIPanGestureRecognizer(target: coordinator, action: #selector(Coordinator.pageSwiped(_:)))
+        pageSwipe.maximumNumberOfTouches = 1
+        pageSwipe.delegate = coordinator
+        scrollView.addGestureRecognizer(pageSwipe)
+
+        return scrollView
+    }
+
+    func updateUIView(_ scrollView: FittingScrollView, context: Context) {
+        let coordinator = context.coordinator
+        coordinator.parent = self
+        coordinator.host?.rootView = content
+
+        // External reset (Reset Zoom button, new strip): animate back to 1x.
+        if scale <= 1, scrollView.zoomScale > 1.01, !coordinator.isUserInteracting {
+            scrollView.setZoomScale(1, animated: true)
         }
     }
 
-    private func magnifyGesture(in size: CGSize) -> some Gesture {
-        MagnifyGesture()
-            .onChanged { value in
-                scale = min(max(baseScale * value.magnification, 1), maxScale)
-                offset = clamped(baseOffset, in: size)
-            }
-            .onEnded { _ in
-                baseScale = scale
-                offset = clamped(offset, in: size)
-                baseOffset = offset
-            }
-    }
+    @MainActor
+    final class Coordinator: NSObject, UIScrollViewDelegate, UIGestureRecognizerDelegate {
+        var parent: ZoomScrollView
+        var host: UIHostingController<Content>?
+        weak var scrollView: UIScrollView?
 
-    private func dragGesture(in size: CGSize) -> some Gesture {
-        DragGesture(minimumDistance: 10)
-            .onChanged { value in
-                if scale > 1 {
-                    offset = clamped(
-                        CGSize(width: baseOffset.width + value.translation.width,
-                               height: baseOffset.height + value.translation.height),
-                        in: size)
-                } else {
-                    let dx = value.translation.width
-                    // Rubber-band when there's nothing in that direction.
-                    swipeOffset = canSwipe(dx < 0 ? .left : .right) ? dx : dx * 0.25
-                }
+        init(_ parent: ZoomScrollView) { self.parent = parent }
+
+        var isUserInteracting: Bool {
+            guard let s = scrollView else { return false }
+            return s.isZooming || s.isDragging || s.isDecelerating || s.isZoomBouncing
+        }
+
+        private var isZoomed: Bool {
+            (scrollView?.zoomScale ?? 1) > 1.01
+        }
+
+        // MARK: UIScrollViewDelegate
+
+        func viewForZooming(in scrollView: UIScrollView) -> UIView? {
+            (scrollView as? FittingScrollView)?.hostView
+        }
+
+        func scrollViewDidZoom(_ scrollView: UIScrollView) {
+            (scrollView as? FittingScrollView)?.centerContent()
+            let newScale = max(scrollView.zoomScale, 1)
+            if abs(parent.scale - newScale) > .ulpOfOne { parent.scale = newScale }
+        }
+
+        // MARK: Double tap
+
+        @objc func doubleTapped(_ recognizer: UITapGestureRecognizer) {
+            guard let scrollView = scrollView, let hostView = (scrollView as? FittingScrollView)?.hostView else { return }
+            if isZoomed {
+                scrollView.setZoomScale(1, animated: true)
+                return
             }
-            .onEnded { value in
-                if scale > 1 {
-                    baseOffset = offset
-                    return
-                }
-                let dx = value.translation.width
+            let zoom: CGFloat = 2.5
+            let point = recognizer.location(in: hostView)
+            let size = scrollView.bounds.size
+            let rect = CGRect(x: point.x - size.width / zoom / 2,
+                              y: point.y - size.height / zoom / 2,
+                              width: size.width / zoom,
+                              height: size.height / zoom)
+            scrollView.zoom(to: rect, animated: true)
+        }
+
+        // MARK: Page swipe (only while not zoomed)
+
+        @objc func pageSwiped(_ recognizer: UIPanGestureRecognizer) {
+            guard let scrollView = scrollView else { return }
+            let reference = scrollView.superview ?? scrollView
+            let dx = recognizer.translation(in: reference).x
+            let width = scrollView.bounds.width
+
+            switch recognizer.state {
+            case .changed:
+                // Rubber-band when there's nothing in that direction.
+                parent.swipeOffset = parent.canSwipe(dx < 0 ? .left : .right) ? dx : dx * 0.25
+            case .ended:
                 let direction: SwipeDirection = dx < 0 ? .left : .right
-                let projected = value.predictedEndTranslation.width
-                let commits = canSwipe(direction)
-                    && (abs(dx) > size.width * 0.3 || (abs(projected) > size.width * 0.6 && abs(dx) > 30))
+                let projected = dx + recognizer.velocity(in: reference).x * 0.25
+                let commits = parent.canSwipe(direction)
+                    && (abs(dx) > width * 0.3 || (abs(projected) > width * 0.6 && abs(dx) > 30))
                 if commits {
-                    let target = direction == .left ? -size.width : size.width
+                    let target = direction == .left ? -width : width
+                    let onSwipe = parent.onSwipe
                     withAnimation(.easeOut(duration: 0.2)) {
-                        swipeOffset = target
+                        parent.swipeOffset = target
                     } completion: {
                         onSwipe?(direction)
                     }
                 } else {
-                    withAnimation(.snappy) { swipeOffset = 0 }
+                    withAnimation(.snappy) { parent.swipeOffset = 0 }
                 }
+            case .cancelled, .failed:
+                withAnimation(.snappy) { parent.swipeOffset = 0 }
+            default:
+                break
             }
-    }
+        }
 
-    private func toggleZoom() {
-        withAnimation(.snappy) {
-            scale = scale > 1 ? 1 : 2.5
+        func gestureRecognizerShouldBegin(_ gestureRecognizer: UIGestureRecognizer) -> Bool {
+            guard let pan = gestureRecognizer as? UIPanGestureRecognizer else { return true }
+            guard !isZoomed else { return false }
+            // Horizontal-dominant drags only, so vertical scrolls aren't hijacked.
+            let v = pan.velocity(in: pan.view)
+            return abs(v.x) > abs(v.y)
+        }
+
+        func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer,
+                               shouldRecognizeSimultaneouslyWith other: UIGestureRecognizer) -> Bool {
+            true
         }
     }
+}
 
-    private func clamped(_ o: CGSize, in size: CGSize) -> CGSize {
-        let maxX = size.width * (scale - 1) / 2
-        let maxY = size.height * (scale - 1) / 2
-        return CGSize(width: min(max(o.width, -maxX), maxX),
-                      height: min(max(o.height, -maxY), maxY))
+/// Scroll view whose single zoomable subview always fills the bounds at 1x and
+/// is centred (via insets) whenever it is smaller than the viewport.
+private final class FittingScrollView: UIScrollView {
+    var hostView: UIView?
+    private var laidOutSize: CGSize = .zero
+
+    override func layoutSubviews() {
+        super.layoutSubviews()
+        guard let hostView, bounds.size != laidOutSize, bounds.width > 0, bounds.height > 0 else { return }
+        laidOutSize = bounds.size
+        zoomScale = 1
+        hostView.frame = CGRect(origin: .zero, size: bounds.size)
+        contentSize = bounds.size
+        contentOffset = .zero
+        centerContent()
+    }
+
+    func centerContent() {
+        let vertical = max(0, (bounds.height - contentSize.height) / 2)
+        let horizontal = max(0, (bounds.width - contentSize.width) / 2)
+        contentInset = UIEdgeInsets(top: vertical, left: horizontal, bottom: vertical, right: horizontal)
     }
 }
